@@ -1,4 +1,4 @@
-# SOC Lab Stack — CLI Reference
+# SOC Lab
 
 ## 1. Architecture
 
