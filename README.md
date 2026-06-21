@@ -1,18 +1,5 @@
 # SOC Lab Stack — CLI Reference
 
-Companion reference for `deploy-soc-stack.sh`. Covers install, day-2 operations,
-and troubleshooting for Wazuh 4.12 + TheHive 5.2 + Cortex 3 on Debian 13, sized
-for an 8GB / 4 vCPU host.
-
-> **Resource reality check:** 8GB is the floor, not a comfort zone. Four
-> JVM-based services (Wazuh indexer, Cassandra, TheHive, Cortex's ES) are
-> memory-hungry by nature. The script tunes heaps down aggressively and adds
-> a 4GB swap file as a safety net, but expect periods of slow indexing or
-> search under load. If you can give the VM 16GB, do it — see the sizing
-> table at the bottom.
-
----
-
 ## 1. Architecture
 
 | Component              | How it runs                 | Port                          | Purpose                               |
