@@ -20,6 +20,23 @@ Environment variables (read from /opt/soc-stack/.env via systemd EnvironmentFile
     WAZUH_ALERTS_PATH   - default /var/ossec/logs/alerts/alerts.json
     MIN_ALERT_LEVEL     - default 7 (Wazuh rule level, 0-15 scale)
     POLL_INTERVAL       - default 2 seconds
+
+    N8N_WEBHOOK_URL     - if set, alerts at/above N8N_MIN_LEVEL are ALSO
+                          POSTed here as clean JSON, in parallel with the
+                          direct TheHive alert above. Leave unset to disable.
+    N8N_MIN_LEVEL       - default 10 (Wazuh rule level). This is the SOAR
+                          escalation threshold: high-severity alerts get
+                          routed through the n8n workflow for case creation,
+                          tagging, and triage assignment, on top of (not
+                          instead of) the plain TheHive alert this bridge
+                          already creates for every alert >= MIN_ALERT_LEVEL.
+
+This bridge intentionally keeps its own TheHive-alert path even when n8n is
+configured. The bridge's direct path is the reliable, always-on record of
+every alert that crosses MIN_ALERT_LEVEL. n8n's job is orchestration on top
+of that: deciding which of those alerts also warrant a full Case, how it
+gets tagged, and who/what it's routed to. If n8n is down, restarting, or
+mid-workflow-edit, you still don't lose alert visibility in TheHive.
 """
 import json
 import os
@@ -34,6 +51,9 @@ ALERTS_PATH = os.environ.get("WAZUH_ALERTS_PATH", "/var/ossec/logs/alerts/alerts
 MIN_LEVEL = int(os.environ.get("MIN_ALERT_LEVEL", "7"))
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "2"))
 OFFSET_FILE = "/opt/soc-stack/bridge/.alerts.offset"
+
+N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "").strip()
+N8N_MIN_LEVEL = int(os.environ.get("N8N_MIN_LEVEL", "10"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -121,6 +141,52 @@ def send_to_thehive(alert: dict) -> bool:
         return False
 
 
+def build_n8n_payload(wz: dict) -> dict:
+    """
+    Clean, flat JSON for n8n to branch on. Deliberately not the same shape
+    as the TheHive alert payload above — n8n shouldn't need to know
+    anything about TheHive's schema to make routing decisions; that
+    translation happens inside the n8n workflow itself.
+    """
+    rule = wz.get("rule", {})
+    agent = wz.get("agent", {})
+    data = wz.get("data", {})
+    level = rule.get("level", 0)
+
+    return {
+        "source": "wazuh",
+        "wazuh_alert_id": str(wz.get("id", "")),
+        "timestamp": wz.get("timestamp"),
+        "rule_id": rule.get("id"),
+        "rule_level": level,
+        "rule_description": rule.get("description", "Unnamed alert"),
+        "rule_groups": rule.get("groups", []),
+        "rule_mitre_ids": rule.get("mitre", {}).get("id", []),
+        "agent_id": agent.get("id"),
+        "agent_name": agent.get("name"),
+        "agent_ip": agent.get("ip"),
+        "src_ip": data.get("srcip"),
+        "dst_ip": data.get("dstip"),
+        "full_log": (wz.get("full_log", "") or "")[:2000],
+    }
+
+
+def send_to_n8n(payload: dict) -> bool:
+    if not N8N_WEBHOOK_URL:
+        return False
+    try:
+        resp = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=10)
+        if resp.status_code in (200, 201, 202):
+            return True
+        log.warning("n8n webhook rejected payload (HTTP %s): %s", resp.status_code, resp.text[:300])
+        return False
+    except requests.RequestException as e:
+        # n8n being unreachable should never block the TheHive path above —
+        # log and move on.
+        log.error("Could not reach n8n at %s: %s", N8N_WEBHOOK_URL, e)
+        return False
+
+
 def tail_alerts():
     if not THEHIVE_API_KEY:
         log.error("THEHIVE_API_KEY is not set. Set it with:")
@@ -129,6 +195,10 @@ def tail_alerts():
 
     log.info("Bridge starting. Watching %s for alerts >= level %d", ALERTS_PATH, MIN_LEVEL)
     log.info("Forwarding to %s", THEHIVE_URL)
+    if N8N_WEBHOOK_URL:
+        log.info("Also forwarding alerts >= level %d to n8n at %s", N8N_MIN_LEVEL, N8N_WEBHOOK_URL)
+    else:
+        log.info("N8N_WEBHOOK_URL not set; n8n SOAR forwarding is disabled.")
 
     while not os.path.exists(ALERTS_PATH):
         log.warning("%s does not exist yet (Wazuh manager may still be starting). Retrying in 10s...", ALERTS_PATH)
@@ -167,6 +237,13 @@ def tail_alerts():
                 log.info("Forwarded alert: %s (level %d)", alert["title"], level)
             else:
                 log.warning("Failed to forward alert (level %d), continuing", level)
+
+            if N8N_WEBHOOK_URL and level >= N8N_MIN_LEVEL:
+                n8n_payload = build_n8n_payload(wz_alert)
+                if send_to_n8n(n8n_payload):
+                    log.info("Routed alert to n8n SOAR workflow: %s (level %d)", n8n_payload["rule_description"], level)
+                else:
+                    log.warning("n8n routing failed for level %d alert (TheHive alert above was still created)", level)
 
             if (forwarded + skipped) % 50 == 0:
                 save_offset(f.tell())
