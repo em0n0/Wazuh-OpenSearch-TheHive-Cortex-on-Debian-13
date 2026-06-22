@@ -1,0 +1,237 @@
+{
+  "name": "Wazuh - TheHive SOAR Triage",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wazuh-soar",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "a1b2c3d4-0001-4000-8000-000000000001",
+      "name": "Wazuh Alert Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1120, 300],
+      "webhookId": "wazuh-soar-intake",
+      "notes": "Receives JSON from wazuh_thehive_bridge.py for alerts at/above N8N_MIN_LEVEL (default 10). See CLI-REFERENCE.md 'n8n SOAR setup' for how to wire the bridge's N8N_WEBHOOK_URL to this node's webhook URL."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize the bridge's payload and derive the case fields we need\n// downstream. Keeping this logic in one Code node (rather than spread\n// across several Set nodes) makes the severity-tier mapping easy to find\n// and edit in one place.\nconst item = $input.item.json;\n\nconst level = Number(item.rule_level || 0);\n\n// TheHive severity scale: 1=low, 2=medium, 3=high, 4=critical\nlet severity = 2;\nlet tier = 'medium';\nif (level >= 13) { severity = 4; tier = 'critical'; }\nelse if (level >= 10) { severity = 3; tier = 'high'; }\nelse if (level >= 7) { severity = 2; tier = 'medium'; }\nelse { severity = 1; tier = 'low'; }\n\nconst mitreIds = Array.isArray(item.rule_mitre_ids) ? item.rule_mitre_ids : [];\nconst tags = ['wazuh', 'soar-auto-case', `tier:${tier}`, `rule:${item.rule_id}`];\nif (item.agent_name) tags.push(`agent:${item.agent_name}`);\nmitreIds.forEach(id => tags.push(`mitre:${id}`));\n\nconst description = [\n  `**Automatically created by n8n SOAR workflow**`,\n  ``,\n  `- Wazuh rule ID: ${item.rule_id}`,\n  `- Rule level: ${level}`,\n  `- Agent: ${item.agent_name || 'unknown'} (${item.agent_id || 'n/a'}, ${item.agent_ip || 'n/a'})`,\n  `- Source IP: ${item.src_ip || 'n/a'}`,\n  `- Destination IP: ${item.dst_ip || 'n/a'}`,\n  `- MITRE ATT&CK: ${mitreIds.length ? mitreIds.join(', ') : 'n/a'}`,\n  `- Timestamp: ${item.timestamp || 'n/a'}`,\n  ``,\n  '```',\n  (item.full_log || '').slice(0, 1500),\n  '```'\n].join('\\n');\n\nreturn {\n  json: {\n    ...item,\n    tier,\n    severity,\n    case_title: `[Wazuh ${tier.toUpperCase()}] ${item.rule_description || 'Unnamed alert'}`.slice(0, 200),\n    case_description: description,\n    case_tags: tags\n  }\n};"
+      },
+      "id": "a1b2c3d4-0002-4000-8000-000000000002",
+      "name": "Normalize & Score Severity",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-880, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.tier }}",
+              "rightValue": "critical",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1b2c3d4-0003-4000-8000-000000000003",
+      "name": "Is Critical?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-640, 300],
+      "notes": "Single-threshold routing: critical-tier alerts (Wazuh level >= 13) get an extra escalation log entry on top of the case TheHive gets either way. Swap the 'Log Escalation' node below for a Slack/Discord/Email node later without touching anything upstream."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.THEHIVE_URL || 'http://thehive:9000' }}/api/v1/case",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  \"title\": $json.case_title,\n  \"description\": $json.case_description,\n  \"severity\": $json.severity,\n  \"tlp\": 2,\n  \"pap\": 2,\n  \"tags\": $json.case_tags,\n  \"flag\": $json.tier === 'critical'\n} }}",
+        "options": {}
+      },
+      "id": "a1b2c3d4-0004-4000-8000-000000000004",
+      "name": "Create TheHive Case",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-400, 220],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_CREDENTIAL_ID",
+          "name": "TheHive API Key"
+        }
+      },
+      "notes": "Uses the 'TheHive API Key' header-auth credential (Authorization: Bearer <key>). See CLI-REFERENCE.md 'n8n SOAR setup' to create it. THEHIVE_URL env var defaults to the in-network service name; override in n8n's docker-compose environment if needed."
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.THEHIVE_URL || 'http://thehive:9000' }}/api/v1/case/{{ $json.id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  \"assignee\": $env.SOC_TRIAGE_ANALYST || undefined\n} }}",
+        "options": {}
+      },
+      "id": "a1b2c3d4-0005-4000-8000-000000000005",
+      "name": "Assign Triage Queue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-160, 220],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_CREDENTIAL_ID",
+          "name": "TheHive API Key"
+        }
+      },
+      "notes": "Optional: set SOC_TRIAGE_ANALYST in n8n's environment (a TheHive username) to auto-assign every SOAR-created case to a default analyst/queue. Leave unset to skip assignment and leave cases unassigned for manual pickup."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Stand-in for a real notification (Slack/Discord/email webhook node).\n// Logs to n8n's own execution log so escalations are visible in the\n// Executions tab even before a notification channel is wired up.\nconst item = $input.item.json;\nconsole.log(`[SOAR ESCALATION] CRITICAL Wazuh alert -> TheHive case ${item.id || '(unknown id)'}: ${item.case_title || item.title}`);\nreturn { json: { ...item, escalation_logged: true } };"
+      },
+      "id": "a1b2c3d4-0006-4000-8000-000000000006",
+      "name": "Log Escalation (replace with notify)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [80, 120],
+      "notes": "Placeholder notification step. To wire real alerting, delete this node and connect 'Assign Triage Queue' -> a Slack/Discord/Send Email node instead. Kept as a Code node so the workflow runs end-to-end with zero external notification credentials required."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\n  \"status\": \"ok\",\n  \"tier\": $json.tier,\n  \"thehive_case_id\": $json.id || null\n} }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "a1b2c3d4-0007-4000-8000-000000000007",
+      "name": "Respond to Bridge",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [320, 300]
+    }
+  ],
+  "connections": {
+    "Wazuh Alert Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Score Severity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Score Severity": {
+      "main": [
+        [
+          {
+            "node": "Is Critical?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Critical?": {
+      "main": [
+        [
+          {
+            "node": "Create TheHive Case",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create TheHive Case",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create TheHive Case": {
+      "main": [
+        [
+          {
+            "node": "Assign Triage Queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assign Triage Queue": {
+      "main": [
+        [
+          {
+            "node": "Log Escalation (replace with notify)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Respond to Bridge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Escalation (replace with notify)": {
+      "main": [
+        [
+          {
+            "node": "Respond to Bridge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateNote": "Both outputs of 'Is Critical?' currently route to the same 'Create TheHive Case' node, so every alert that reaches this workflow (i.e. already >= N8N_MIN_LEVEL from the bridge) gets a case either way. The branch exists so you can easily split behavior later -- e.g. point the TRUE output (critical) at a faster/different notification path -- without restructuring the workflow. See CLI-REFERENCE.md 'n8n SOAR setup' for the single-threshold model this lab uses: the bridge's N8N_MIN_LEVEL controls whether an alert reaches n8n at all (the actual triage threshold); the 'Is Critical?' node inside n8n controls only the escalation-logging branch within that already-high-severity population."
+  }
+}
