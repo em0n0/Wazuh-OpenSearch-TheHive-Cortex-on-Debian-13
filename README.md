@@ -7,7 +7,7 @@ for an 8GB / 4 vCPU host.
 > **Resource reality check:** 8GB is the floor, not a comfort zone. Four
 > JVM-based services (Wazuh indexer, Cassandra, TheHive, Cortex's ES) are
 > memory-hungry by nature. The script tunes heaps down aggressively and adds
-> a 4GB swap file as a safety net, but expect periods of slow indexing or
+> a 4GB swap file as a safety net, but expect slow indexing or
 > search under load. If you can give the VM 16GB, do it — see the sizing
 > table at the bottom.
 
