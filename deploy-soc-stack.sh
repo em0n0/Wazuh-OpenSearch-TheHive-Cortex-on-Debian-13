@@ -6,20 +6,26 @@
 #   - Wazuh 4.12 (manager + indexer/OpenSearch + dashboard) — native packages
 #   - TheHive 5.2 + Cassandra — Docker, local filesystem storage (no MinIO)
 #   - Cortex 3 + Elasticsearch (Cortex's own index backend) — Docker
-#   - A lightweight Python webhook bridge: Wazuh alerts -> TheHive alerts
+#   - n8n — Docker, SQLite backend — SOAR orchestration for high-severity alerts
+#   - A lightweight Python bridge: Wazuh alerts -> TheHive alerts (always on),
+#     plus a parallel forward of high-severity alerts -> n8n webhook (SOAR)
 #
-# Target spec: 8GB RAM / 4 vCPU. This is a TIGHT fit for four heavy JVM-based
-# services. JVM heaps are deliberately undersized vs. upstream defaults and a
-# swap file is added as a safety net. Expect slower indexing/search than a
-# 16GB+ box. See the companion CLI-REFERENCE.md for day-2 operations.
+# Target spec: 8GB RAM / 4 vCPU. This is a TIGHT fit for five services, four
+# of them JVM-based. JVM heaps are deliberately undersized vs. upstream
+# defaults and a swap file is added as a safety net. Adding n8n pushes this
+# host closer to its ceiling — see CLI-REFERENCE.md's sizing table if you're
+# also running several Cortex analyzers concurrently.
 #
 # Usage:
 #   sudo ./deploy-soc-stack.sh install        # full install, all components
 #   sudo ./deploy-soc-stack.sh install wazuh  # only the Wazuh stack
 #   sudo ./deploy-soc-stack.sh install hive   # only TheHive+Cassandra
 #   sudo ./deploy-soc-stack.sh install cortex # only Cortex+ES
+#   sudo ./deploy-soc-stack.sh install n8n    # only n8n
 #   sudo ./deploy-soc-stack.sh install bridge # only the alert bridge
 #   sudo ./deploy-soc-stack.sh status         # health check all components
+#   sudo ./deploy-soc-stack.sh set-hive-key <key>      # wire bridge -> TheHive
+#   sudo ./deploy-soc-stack.sh set-n8n-webhook <url>   # wire bridge -> n8n
 #   sudo ./deploy-soc-stack.sh uninstall      # tear everything down
 #
 # Re-run safe: each stage checks for prior completion via marker files in
@@ -44,6 +50,7 @@ THEHIVE_IMAGE="strangebee/thehive:5.2"
 CASSANDRA_IMAGE="cassandra:4"
 CORTEX_IMAGE="thehiveproject/cortex:3.1.7"
 CORTEX_ES_IMAGE="docker.elastic.co/elasticsearch/elasticsearch:7.17.9"
+N8N_IMAGE="docker.n8n.io/n8nio/n8n:latest"
 
 FORCE=0
 COMPONENT="${2:-all}"
@@ -55,6 +62,9 @@ WAZUH_INDEXER_HEAP="1500m"
 CORTEX_ES_HEAP="512m"
 THEHIVE_HEAP="1024m"
 CASSANDRA_HEAP="1024m"
+# n8n (Node.js, not JVM) is capped via Docker mem_limit rather than a heap
+# flag; SQLite backend, no Postgres, to avoid adding a 5th heavy container.
+N8N_MEM_LIMIT="400m"
 
 # ============================================================================
 # Helpers
@@ -91,6 +101,10 @@ check_resources() {
     if (( mem_gb < 7 )); then
         warn "Less than 7GB RAM detected. This stack targets 8GB minimum and"
         warn "will be unstable below that. Continuing anyway, but expect OOM kills."
+    elif (( mem_gb < 9 )); then
+        info "8GB detected — this is the supported floor. With n8n added as a"
+        info "5th service, headroom is thin; avoid running heavy Cortex analyzer"
+        info "jobs at the same time as n8n workflow bursts."
     fi
     if (( disk_gb < 40 )); then
         warn "Less than 40GB free disk. Wazuh's vulnerability DB alone can use"
@@ -111,13 +125,9 @@ stage_prereqs() {
     apt-get update -y
     apt-get install -y --no-install-recommends \
         curl wget gnupg apt-transport-https ca-certificates \
-        software-properties-common openssl jq python3 python3-pip python3-venv \
+        openssl jq python3 python3-pip python3-venv \
         unzip lsb-release
 
-    # Debian 13 note: the upstream wazuh-install.sh script references
-    # software-properties-common in an apt check that fails on Trixie's
-    # package naming. We install it ourselves above so the script's check
-    # passes without needing to patch the installer.
 
     setup_swap
     install_docker
@@ -168,6 +178,8 @@ install_docker() {
 # whether we hit them via native Wazuh or any future container indexer.
 apply_vm_max_map_count() {
     sysctl -w vm.max_map_count=262144
+    # /etc/sysctl.conf may not exist on a fresh Debian 13 install
+    touch /etc/sysctl.conf
     if ! grep -q 'vm.max_map_count' /etc/sysctl.conf; then
         echo 'vm.max_map_count=262144' >> /etc/sysctl.conf
     fi
@@ -186,6 +198,12 @@ stage_wazuh() {
     mkdir -p "$work" && cd "$work"
     curl -sO "$WAZUH_INSTALL_URL"
     chmod +x wazuh-install.sh
+
+    # Debian 13 (Trixie) fix: Wazuh's installer tries to apt-install
+    # software-properties-common which does not exist on Debian 13.
+    # Remove the string from every line it appears on in the script.
+    info "Patching wazuh-install.sh for Debian 13 compatibility..."
+    sed -i 's/software-properties-common//g' wazuh-install.sh
 
     info "Running Wazuh all-in-one installer (this takes 5-15 minutes)..."
     bash wazuh-install.sh -a -i | tee -a "$LOG_FILE"
@@ -371,7 +389,80 @@ EOF
 }
 
 # ============================================================================
-# Stage 4: Wazuh -> TheHive alert bridge
+# Stage 4: n8n (SOAR orchestration)
+# ============================================================================
+stage_n8n() {
+    if is_done "n8n"; then info "n8n already installed, skipping."; return; fi
+    info "=== Stage: n8n (SOAR workflow automation) ==="
+
+    mkdir -p "${STACK_DIR}/n8n/data"
+    ensure_env_file
+    write_n8n_compose
+
+    cd "$STACK_DIR"
+    docker compose -f docker-compose.n8n.yml --env-file "$ENV_FILE" up -d
+
+    info "Waiting for n8n to become healthy (first boot can take a minute)..."
+    wait_for_http "http://localhost:5678/healthz" 90
+
+    # Keep a copy of the workflow JSON alongside the rest of the stack's
+    # persistent state, so it's discoverable even if the script's original
+    # directory is later moved or deleted.
+    if [[ -f "${SCRIPT_DIR}/files/n8n-wazuh-thehive-soar-workflow.json" ]]; then
+        cp "${SCRIPT_DIR}/files/n8n-wazuh-thehive-soar-workflow.json" "${STACK_DIR}/n8n-wazuh-thehive-soar-workflow.json"
+    fi
+
+    mark_done "n8n"
+    info "n8n installed. UI: http://<host-ip>:5678"
+    info "Next: complete the n8n setup wizard, then import the workflow from"
+    info "  ${STACK_DIR}/n8n-wazuh-thehive-soar-workflow.json"
+    info "and follow 'n8n SOAR setup' in CLI-REFERENCE.md to wire credentials"
+    info "and point the bridge's N8N_WEBHOOK_URL at the workflow's webhook node."
+}
+
+write_n8n_compose() {
+    cat > "${STACK_DIR}/docker-compose.n8n.yml" <<EOF
+services:
+  n8n:
+    image: ${N8N_IMAGE}
+    container_name: soc-n8n
+    restart: unless-stopped
+    mem_limit: ${N8N_MEM_LIMIT}
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_ENCRYPTION_KEY=\${N8N_ENCRYPTION_KEY}
+      - GENERIC_TIMEZONE=\${SOC_TIMEZONE:-UTC}
+      - TZ=\${SOC_TIMEZONE:-UTC}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - N8N_RUNNERS_ENABLED=true
+      # SQLite (default) backend — fine for a single-analyst lab. Switch to
+      # Postgres only if you're adding concurrent users or heavy execution
+      # history; that's another container this 8GB budget doesn't have room for.
+      - EXECUTIONS_DATA_MAX_AGE=168
+      - EXECUTIONS_DATA_PRUNE=true
+      # Consumed by the imported workflow's HTTP Request / Code nodes via
+      # n8n expressions like {{ \$env.THEHIVE_URL }}. THEHIVE_URL uses the
+      # Docker service name (not localhost) since n8n calls TheHive over
+      # the shared soc-net network, not through the host.
+      - THEHIVE_URL=http://thehive:9000
+      - SOC_TRIAGE_ANALYST=\${SOC_TRIAGE_ANALYST:-}
+    volumes:
+      - ${STACK_DIR}/n8n/data:/home/node/.n8n
+    networks:
+      - soc-net
+
+networks:
+  soc-net:
+    name: soc-net
+    external: true
+EOF
+}
+
+# ============================================================================
+# Stage 5: Wazuh -> TheHive alert bridge (also forwards high-severity
+# alerts to n8n for SOAR orchestration, if N8N_WEBHOOK_URL is configured)
 # ============================================================================
 stage_bridge() {
     if is_done "bridge"; then info "Alert bridge already installed, skipping."; return; fi
@@ -385,8 +476,33 @@ stage_bridge() {
     fi
 
     install -d -m 755 /opt/soc-stack/bridge
-    cp "${SCRIPT_DIR}/files/wazuh_thehive_bridge.py" /opt/soc-stack/bridge/bridge.py
-    cp "${SCRIPT_DIR}/files/bridge-requirements.txt" /opt/soc-stack/bridge/requirements.txt
+
+    # Support both a flat layout (files alongside the script, as extracted from
+    # the zip) and a files/ subdirectory layout. Also tolerate the common typo
+    # "bridge-requiremens.txt" (missing the t) from the zip.
+    local bridge_src=""
+    for candidate in \
+        "${SCRIPT_DIR}/files/wazuh_thehive_bridge.py" \
+        "${SCRIPT_DIR}/wazuh_thehive_bridge.py"; do
+        [[ -f "$candidate" ]] && { bridge_src="$candidate"; break; }
+    done
+    [[ -n "$bridge_src" ]] || die "wazuh_thehive_bridge.py not found next to deploy-soc-stack.sh (looked in ${SCRIPT_DIR} and ${SCRIPT_DIR}/files/)"
+    cp "$bridge_src" /opt/soc-stack/bridge/bridge.py
+
+    local req_src=""
+    for candidate in \
+        "${SCRIPT_DIR}/files/bridge-requirements.txt" \
+        "${SCRIPT_DIR}/files/bridge-requiremens.txt" \
+        "${SCRIPT_DIR}/bridge-requirements.txt" \
+        "${SCRIPT_DIR}/bridge-requiremens.txt"; do
+        [[ -f "$candidate" ]] && { req_src="$candidate"; break; }
+    done
+    if [[ -n "$req_src" ]]; then
+        cp "$req_src" /opt/soc-stack/bridge/requirements.txt
+    else
+        warn "bridge-requirements.txt not found — writing a minimal fallback."
+        echo "requests==2.32.3" > /opt/soc-stack/bridge/requirements.txt
+    fi
 
     python3 -m venv /opt/soc-stack/bridge/venv
     /opt/soc-stack/bridge/venv/bin/pip install --quiet --upgrade pip
@@ -447,6 +563,18 @@ ensure_env_file() {
 THEHIVE_SECRET=$(rand_secret)
 THEHIVE_API_KEY=
 WAZUH_API_USER=wazuh-wui
+
+# n8n
+N8N_ENCRYPTION_KEY=$(rand_secret)
+SOC_TIMEZONE=UTC
+
+# Bridge -> n8n SOAR forwarding. N8N_WEBHOOK_URL stays empty until you've
+# created the workflow in n8n and copied its webhook URL here (see
+# CLI-REFERENCE.md, "n8n SOAR setup"). Until it's set, the bridge keeps
+# forwarding every alert >= MIN_ALERT_LEVEL straight to TheHive as before;
+# n8n orchestration is purely additive.
+N8N_WEBHOOK_URL=
+N8N_MIN_LEVEL=10
 EOF
     chmod 600 "$ENV_FILE"
 }
@@ -478,6 +606,18 @@ cmd_status() {
     echo "=== Alert bridge ==="
     systemctl is-active wazuh-thehive-bridge 2>/dev/null | xargs echo "  bridge:   "
     echo
+    echo "=== n8n SOAR ==="
+    if docker ps --filter "name=soc-n8n" --format '{{.Status}}' 2>/dev/null | grep -q .; then
+        docker ps --filter "name=soc-n8n" --format "  n8n: {{.Status}}"
+    else
+        echo "  n8n: not running"
+    fi
+    if [[ -f "$ENV_FILE" ]] && grep -q '^N8N_WEBHOOK_URL=.\+' "$ENV_FILE" 2>/dev/null; then
+        echo "  webhook configured: yes"
+    else
+        echo "  webhook configured: no (run: $0 set-n8n-webhook <url>)"
+    fi
+    echo
     echo "=== Resource usage ==="
     free -h | head -2
     echo
@@ -493,6 +633,18 @@ cmd_set_hive_key() {
     systemctl restart wazuh-thehive-bridge 2>/dev/null || info "Bridge not yet installed/started; will pick up key on next start."
 }
 
+cmd_set_n8n_webhook() {
+    local url="${1:-}"
+    [[ -n "$url" ]] || die "Usage: $0 set-n8n-webhook <webhook-url>"
+    [[ -f "$ENV_FILE" ]] || die "${ENV_FILE} not found. Run install first."
+    # Escape & and | for sed safety since webhook URLs may contain query strings.
+    local escaped_url
+    escaped_url=$(printf '%s\n' "$url" | sed -e 's/[&|]/\\&/g')
+    sed -i "s|^N8N_WEBHOOK_URL=.*|N8N_WEBHOOK_URL=${escaped_url}|" "$ENV_FILE"
+    info "N8N_WEBHOOK_URL updated. Restarting bridge..."
+    systemctl restart wazuh-thehive-bridge 2>/dev/null || info "Bridge not yet installed/started; will pick up URL on next start."
+}
+
 cmd_uninstall() {
     confirm "This will STOP and REMOVE Wazuh, TheHive, Cortex, and all their data. Continue?" || { info "Aborted."; exit 0; }
 
@@ -500,6 +652,7 @@ cmd_uninstall() {
     cd "$STACK_DIR" 2>/dev/null && {
         docker compose -f docker-compose.hive.yml down -v 2>/dev/null || true
         docker compose -f docker-compose.cortex.yml down -v 2>/dev/null || true
+        docker compose -f docker-compose.n8n.yml down -v 2>/dev/null || true
     }
     docker network rm soc-net 2>/dev/null || true
 
@@ -539,24 +692,32 @@ main() {
             mkdir -p "$STATE_DIR"
             touch "$LOG_FILE"
             check_resources
-            ensure_network
             case "$COMPONENT" in
                 all)
                     stage_prereqs
+                    ensure_network
                     stage_wazuh
                     stage_hive
                     stage_cortex
+                    stage_n8n
                     stage_bridge
                     ;;
-                wazuh)  stage_prereqs; stage_wazuh ;;
-                hive)   stage_prereqs; stage_hive ;;
-                cortex) stage_prereqs; stage_cortex ;;
+                wazuh)  stage_prereqs; ensure_network; stage_wazuh ;;
+                hive)   stage_prereqs; ensure_network; stage_hive ;;
+                cortex) stage_prereqs; ensure_network; stage_cortex ;;
+                n8n)    stage_prereqs; ensure_network; stage_n8n ;;
                 bridge) stage_bridge ;;
-                *) die "Unknown component '$COMPONENT'. Use: all|wazuh|hive|cortex|bridge" ;;
+                *) die "Unknown component '$COMPONENT'. Use: all|wazuh|hive|cortex|n8n|bridge" ;;
             esac
             echo
             info "=== Install complete. Run '$0 status' to check health. ==="
             [[ -f "${STACK_DIR}/wazuh-passwords.txt" ]] && info "Wazuh credentials: ${STACK_DIR}/wazuh-passwords.txt"
+            if [[ "$COMPONENT" == "all" || "$COMPONENT" == "n8n" ]]; then
+                info "Next: open http://<host-ip>:5678, finish n8n's setup wizard, import"
+                info "${STACK_DIR}/n8n-wazuh-thehive-soar-workflow.json, then run"
+                info "'$0 set-n8n-webhook <url>' and '$0 set-hive-key <key>'."
+                info "Full walkthrough: 'n8n SOAR setup' in CLI-REFERENCE.md."
+            fi
             ;;
         status)
             cmd_status
@@ -565,12 +726,16 @@ main() {
             require_root
             cmd_set_hive_key "${2:-}"
             ;;
+        set-n8n-webhook)
+            require_root
+            cmd_set_n8n_webhook "${2:-}"
+            ;;
         uninstall)
             require_root
             cmd_uninstall
             ;;
         *)
-            echo "Usage: $0 {install [all|wazuh|hive|cortex|bridge]|status|set-hive-key <key>|uninstall} [--force]"
+            echo "Usage: $0 {install [all|wazuh|hive|cortex|n8n|bridge]|status|set-hive-key <key>|set-n8n-webhook <url>|uninstall} [--force]"
             exit 1
             ;;
     esac
