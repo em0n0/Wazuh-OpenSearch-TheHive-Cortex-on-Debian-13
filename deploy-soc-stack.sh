@@ -284,7 +284,8 @@ services:
     restart: unless-stopped
     mem_limit: 1500m
     depends_on:
-      - cassandra
+      cassandra:
+        condition: service_healthy
     ports:
       - "9000:9000"
     environment:
@@ -296,9 +297,7 @@ services:
       - "cassandra"
       - --index-backend
       - "lucene"
-      - --storage-provider
-      - "localfs"
-      - --storage-localfs-location
+      - --storage-directory
       - "/opt/thp/thehive/files"
     volumes:
       - ${STACK_DIR}/thehive/data:/opt/thp/thehive/data
@@ -368,7 +367,8 @@ services:
     restart: unless-stopped
     mem_limit: 1000m
     depends_on:
-      - cortex-elasticsearch
+      cortex-elasticsearch:
+        condition: service_healthy
     ports:
       - "9001:9001"
     environment:
