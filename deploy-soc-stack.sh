@@ -202,8 +202,17 @@ stage_wazuh() {
     # Debian 13 (Trixie) fix: Wazuh's installer tries to apt-install
     # software-properties-common which does not exist on Debian 13.
     # Remove the string from every line it appears on in the script.
-    info "Patching wazuh-install.sh for Debian 13 compatibility..."
-    sed -i 's/software-properties-common//g' wazuh-install.sh
+    # software-properties-common does not exist on Debian 13 (Trixie) and
+    # causes the Wazuh installer to abort. On Debian 12 (Bookworm) and Ubuntu
+    # it exists fine, so we only patch this out on Trixie.
+    local os_codename
+    os_codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
+    if [[ "$os_codename" == "trixie" ]]; then
+        info "Debian 13 (Trixie) detected — patching wazuh-install.sh to remove software-properties-common dependency..."
+        sed -i 's/software-properties-common//g' wazuh-install.sh
+    else
+        info "OS: ${os_codename} — no wazuh-install.sh patch needed."
+    fi
 
     info "Running Wazuh all-in-one installer (this takes 5-15 minutes)..."
     bash wazuh-install.sh -a -i | tee -a "$LOG_FILE"
