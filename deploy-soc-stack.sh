@@ -239,8 +239,14 @@ stage_hive() {
     info "=== Stage: TheHive 5.2 + Cassandra (Docker, local fs storage) ==="
 
     mkdir -p "${STACK_DIR}/thehive/data" "${STACK_DIR}/thehive/files" \
-             "${STACK_DIR}/cassandra/data"
+             "${STACK_DIR}/cassandra/data" "${STACK_DIR}/thehive/es-data"
+    # TheHive's container runs as uid:gid 1000:1000 internally; the host-side
+    # bind mounts must be owned by that uid or the entrypoint fails with
+    # "directory is not writable" and loops forever waiting on Cassandra.
+    chown -R 1000:1000 "${STACK_DIR}/thehive"
     chmod 700 "${STACK_DIR}/thehive/files"
+    # Cassandra's official image also runs as uid:gid 999:999
+    chown -R 999:999 "${STACK_DIR}/cassandra/data"
 
     ensure_env_file
     write_hive_compose
