@@ -1,0 +1,2 @@
+# Self-test only: harmless public test page that returns the string "uid=0(root)"
+alert http any any -> any any (msg:"SOC-IPS selftest uid=0(root) response"; flow:established,to_client; file.data; content:"uid=0(root)"; classtype:bad-unknown; sid:9000001; rev:1;)

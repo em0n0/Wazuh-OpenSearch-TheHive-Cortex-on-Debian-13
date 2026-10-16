@@ -1,0 +1,96 @@
+<!-- Custom rules for Suricata IPS (100200-100229) and Kismet WIPS (100300-100329).
+     Installed to /var/ossec/etc/rules/soc-ips_rules.xml by deploy-soc-stack.sh -->
+<group name="soc,suricata,ips,">
+
+  <!-- 86601 = Wazuh's built-in "Suricata: Alert" rule -->
+  <rule id="100201" level="9">
+    <if_sid>86601</if_sid>
+    <field name="alert.action">^blocked$</field>
+    <description>Suricata IPS BLOCKED: $(alert.signature)</description>
+    <mitre><id>T1190</id></mitre>
+  </rule>
+
+  <rule id="100202" level="12">
+    <if_sid>100201</if_sid>
+    <field name="alert.severity">^1$</field>
+    <description>Suricata IPS BLOCKED high-severity: $(alert.signature)</description>
+  </rule>
+
+  <rule id="100203" level="12" frequency="8" timeframe="120">
+    <if_matched_sid>100201</if_matched_sid>
+    <same_field>src_ip</same_field>
+    <description>Suricata IPS: repeated blocks from $(src_ip) — persistent attacker or infected host</description>
+  </rule>
+
+  <rule id="100210" level="10">
+    <if_sid>86601</if_sid>
+    <field name="alert.action">^allowed$</field>
+    <field name="alert.severity">^1$</field>
+    <description>Suricata (detect-only) high-severity alert: $(alert.signature)</description>
+  </rule>
+
+  <rule id="100220" level="12">
+    <if_sid>86600</if_sid>
+    <match>"event_type":"stats"</match>
+    <field name="stats.capture.kernel_drops">^[1-9]</field>
+    <description>Suricata is dropping packets (overloaded) — IPS coverage degraded</description>
+  </rule>
+</group>
+
+<group name="soc,wips,wireless,">
+  <rule id="100300" level="3">
+    <decoded_as>json</decoded_as>
+    <field name="integration">^soc-wips$</field>
+    <description>WIPS event: $(wips.type)</description>
+  </rule>
+
+  <rule id="100301" level="6">
+    <if_sid>100300</if_sid>
+    <field name="wips.severity">^low$|^medium$</field>
+    <description>WIPS $(wips.type): $(wips.message)</description>
+  </rule>
+
+  <rule id="100302" level="10">
+    <if_sid>100300</if_sid>
+    <field name="wips.severity">^high$</field>
+    <description>WIPS $(wips.type): $(wips.message)</description>
+  </rule>
+
+  <rule id="100303" level="13">
+    <if_sid>100300</if_sid>
+    <field name="wips.severity">^critical$</field>
+    <description>WIPS CRITICAL $(wips.type): $(wips.message)</description>
+  </rule>
+
+  <rule id="100310" level="13">
+    <if_sid>100300</if_sid>
+    <field name="wips.type">^ROGUE_AP$|^APSPOOF$</field>
+    <description>Wireless evil-twin / rogue AP impersonating your SSID: $(wips.message)</description>
+    <mitre><id>T1557</id></mitre>
+  </rule>
+
+  <rule id="100311" level="12">
+    <if_sid>100300</if_sid>
+    <field name="wips.type">^DEAUTHFLOOD$|^BCASTDISCON$|^DISASSOCTRAFFIC$</field>
+    <description>Wireless deauthentication/disassociation attack: $(wips.message)</description>
+    <mitre><id>T1498</id></mitre>
+  </rule>
+
+  <rule id="100312" level="12">
+    <if_sid>100300</if_sid>
+    <field name="wips.type">^KARMAOUI$|^PROBENOJOIN$</field>
+    <description>Wireless KARMA/Mana-style rogue AP behaviour: $(wips.message)</description>
+  </rule>
+
+  <rule id="100313" level="11">
+    <if_sid>100300</if_sid>
+    <field name="wips.type">^WPSBRUTE$|^NONCEREUSE$|^NONCEDEGRADE$|^RSNLOOP$</field>
+    <description>Wireless key-attack indicator ($(wips.type)): $(wips.message)</description>
+  </rule>
+
+  <rule id="100320" level="13" frequency="3" timeframe="300">
+    <if_matched_sid>100311</if_matched_sid>
+    <same_field>wips.bssid</same_field>
+    <description>Sustained wireless deauth attack against $(wips.bssid)</description>
+  </rule>
+</group>
